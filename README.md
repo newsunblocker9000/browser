@@ -5,6 +5,7 @@ Private web gateway plus a hosted browser app, in one Cloudflare Worker (`worker
 - `/app` the browser app (tabs, address bar, view modes, passphrase login)
 - `/?u=<url>` the gateway (needs the `X-Proxy-Token` header, or the signed `?k=` key the Worker adds to pages it rewrites)
 - `/?ping=1` passphrase check
+- `/chat` Claude chat page using the Claude API (unlock at `/app` first). Needs a second secret, `ANTHROPIC_API_KEY`, from console.anthropic.com. This is API access billed per use, separate from a claude.ai account.
 
 ## Setup
 

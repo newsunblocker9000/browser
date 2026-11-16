@@ -10,6 +10,8 @@
  *   /?u=<url>             the gateway (needs the passphrase header, or a signed ?k= key
  *                         that the Worker itself puts into pages it rewrites)
  *   /?ping=1              passphrase check used by the login screen
+ *   /chat                 Claude chat page (uses the Claude API, needs the ANTHROPIC_API_KEY secret)
+ *   /api/chat             its backend (needs the passphrase header)
  *   anything else         404
  *
  * Gateway behaviour
@@ -64,6 +66,10 @@ async function handle(request, env) {
   if (url.pathname === '/app' || url.pathname === '/app/') {
     return request.method === 'GET' ? serveApp() : new Response('Method not allowed', { status: 405 });
   }
+  if (url.pathname === '/chat' || url.pathname === '/chat/') {
+    return request.method === 'GET' ? serveChat() : new Response('Method not allowed', { status: 405 });
+  }
+  if (url.pathname === '/api/chat') return chatApi(request, url, env);
   if (url.pathname === '/robots.txt') {
     return new Response('User-agent: *\nDisallow: /\n', { headers: { 'Content-Type': 'text/plain' } });
   }
@@ -683,6 +689,7 @@ const APP_BODY = `
       <div id="tabs"></div>
       <button id="addtab" type="button" title="New tab">+</button>
       <div class="spacer"></div>
+      <button class="link" id="openchat" type="button">Claude</button>
       <button class="link" id="clearck" type="button">Clear cookies</button>
       <button class="link" id="popout" type="button">Pop out</button>
       <button class="link" id="lock" type="button">Lock</button>
@@ -1165,6 +1172,9 @@ function appMain() {
   $('lock').addEventListener('click', function () {
     lock('');
   });
+  $('openchat').addEventListener('click', function () {
+    window.open('/chat', '_blank');
+  });
   $('clearck').addEventListener('click', function () {
     jarClear();
     status('Cookies cleared');
@@ -1205,13 +1215,20 @@ function appMain() {
   }
 }
 
-function serveApp() {
+const PAGE_CSP =
+  // Pages are shown in a srcdoc iframe, which inherits this policy, so it has to allow
+  // the Worker's own images/fonts/styles/scripts (for js=1) and inline content.
+  "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data: blob:; " +
+  "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+function servePage(title, css, body, main) {
   const page =
     '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    '<meta name="robots" content="noindex,nofollow"><title>Browser</title>' +
-    '<style>' + APP_CSS + '</style></head><body>' + APP_BODY +
-    '<scr' + 'ipt>var __name=function(f){return f};(' + appMain.toString() + ')();</scr' + 'ipt>' +
+    '<meta name="robots" content="noindex,nofollow"><title>' + title + '</title>' +
+    '<style>' + css + '</style></head><body>' + body +
+    '<scr' + 'ipt>var __name=function(f){return f};(' + main.toString() + ')();</scr' + 'ipt>' +
     '</body></html>';
   return new Response(page, {
     headers: {
@@ -1220,12 +1237,227 @@ function serveApp() {
       'X-Robots-Tag': 'noindex',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
-      // Pages are shown in a srcdoc iframe, which inherits this policy, so it has to allow
-      // the Worker's own images/fonts/styles/scripts (for js=1) and inline content.
-      'Content-Security-Policy':
-        "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
-        "img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data: blob:; " +
-        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+      'Content-Security-Policy': PAGE_CSP,
     },
   });
+}
+
+function serveApp() {
+  return servePage('Browser', APP_CSS, APP_BODY, appMain);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CLAUDE CHAT (served at /chat)
+   Talks to the Claude API through /api/chat with the key held in the ANTHROPIC_API_KEY
+   secret. This is API access, separate from a claude.ai account and its chat history.
+═══════════════════════════════════════════════════════════════════════════ */
+
+const CHAT_MODEL = /^claude-[a-z0-9.-]{3,60}$/;
+
+async function chatApi(request, url, env) {
+  if (request.method !== 'POST') return fail(405, 'Method not allowed.');
+  if (!env.PROXY_TOKEN) return fail(500, 'PROXY_TOKEN is not configured on the Worker.');
+  const auth = await authenticate(request, url, env);
+  if (auth === 'locked') {
+    return fail(429, 'Too many failed attempts. Try again in a few minutes.', { 'Retry-After': String(FAIL_WINDOW) });
+  }
+  if (auth !== 'ok') return fail(401, 'Unauthorized.');
+  if (!env.ANTHROPIC_API_KEY) return fail(500, 'ANTHROPIC_API_KEY is not configured on the Worker.');
+
+  const raw = await request.text();
+  if (raw.length > MAX_BODY) return fail(413, 'Conversation too large. Start a new chat.');
+  let j;
+  try {
+    j = JSON.parse(raw);
+  } catch (_) {
+    return fail(400, 'Bad request.');
+  }
+  const model = typeof j.model === 'string' && CHAT_MODEL.test(j.model) ? j.model : '';
+  const messages = (Array.isArray(j.messages) ? j.messages : [])
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content)
+    .map((m) => ({ role: m.role, content: m.content }));
+  if (!model || !messages.length) return fail(400, 'Bad request.');
+
+  const up = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model, max_tokens: 4096, stream: true, messages }),
+  });
+  if (!up.ok) {
+    let msg = await up.text();
+    try {
+      msg = JSON.parse(msg).error.message;
+    } catch (_) {}
+    return fail(up.status, 'Claude API: ' + msg);
+  }
+  return new Response(up.body, {
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' },
+  });
+}
+
+const CHAT_CSS = `
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:#121216;color:#e2e2e6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.hidden{display:none!important}
+button,textarea,select{font:inherit}
+#chat{display:flex;flex-direction:column;height:100vh;max-width:860px;margin:0 auto}
+#top{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #292934}
+#top h1{margin:0;font-size:15px;font-weight:600;flex:1}
+#model,.btn{background:#1e1e26;border:1px solid #2d2d38;border-radius:6px;color:#c4c4d0;font-size:12px;padding:5px 8px;cursor:pointer}
+.btn:hover{border-color:#3b82f6;color:#fff}
+#log{flex:1;overflow-y:auto;padding:16px 12px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:88%;padding:10px 12px;border-radius:10px;font-size:14px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.msg.user{align-self:flex-end;background:#2563eb;color:#fff}
+.msg.assistant{align-self:flex-start;background:#1e1e26;border:1px solid #2d2d38}
+.msg.err{align-self:flex-start;background:#3a1d1d;border:1px solid #6b2a2a;color:#fca5a5}
+#send{display:flex;gap:8px;padding:10px 12px;border-top:1px solid #292934}
+#in{flex:1;min-height:44px;max-height:200px;resize:vertical;background:#0d0d12;border:1px solid #2d2d38;border-radius:8px;color:#f4f4f8;padding:10px;font-size:14px;outline:none}
+#in:focus{border-color:#3b82f6}
+.go{background:#3b82f6;border:none;border-radius:8px;color:#fff;padding:0 16px;font-size:13px;font-weight:600;cursor:pointer}
+.go:disabled{opacity:.5;cursor:default}
+#need{padding:40px 20px;text-align:center;color:#c4c4d0;font-size:14px}
+#need a{color:#60a5fa}
+`;
+
+const CHAT_BODY = `
+<div id="need" class="hidden">Unlock the browser first: <a href="/app">open /app</a>, enter your passphrase, then come back here.</div>
+<div id="chat">
+  <div id="top">
+    <h1>Claude</h1>
+    <select id="model" title="Model">
+      <option value="claude-sonnet-5-5">Sonnet 5.5</option>
+      <option value="claude-opus-5-5">Opus 5.5</option>
+      <option value="claude-haiku-5-5">Haiku 5.5</option>
+    </select>
+    <button class="btn" id="new" type="button">New chat</button>
+  </div>
+  <div id="log"></div>
+  <form id="send">
+    <textarea id="in" placeholder="Message Claude (Enter to send, Shift+Enter for a new line)"></textarea>
+    <button class="go" id="gobtn" type="submit">Send</button>
+  </form>
+</div>
+`;
+
+function chatMain() {
+  var $ = function (id) {
+    return document.getElementById(id);
+  };
+  var token = '';
+  var msgs = [];
+  var busy = false;
+  try {
+    token = sessionStorage.getItem('pp_tok') || localStorage.getItem('pp_tok') || '';
+  } catch (e) {}
+  if (!token) {
+    $('need').classList.remove('hidden');
+    $('chat').classList.add('hidden');
+    return;
+  }
+  try {
+    var a = JSON.parse(sessionStorage.getItem('pp_chat') || '[]');
+    if (Array.isArray(a)) msgs = a;
+    var sm = sessionStorage.getItem('pp_model');
+    if (sm) $('model').value = sm;
+  } catch (e) {}
+
+  function save() {
+    try {
+      sessionStorage.setItem('pp_chat', JSON.stringify(msgs));
+    } catch (e) {}
+  }
+  function add(role, text) {
+    var d = document.createElement('div');
+    d.className = 'msg ' + role;
+    d.textContent = text;
+    $('log').appendChild(d);
+    $('log').scrollTop = $('log').scrollHeight;
+    return d;
+  }
+  msgs.forEach(function (m) {
+    add(m.role, m.content);
+  });
+
+  async function send() {
+    if (busy) return;
+    var t = $('in').value.trim();
+    if (!t) return;
+    busy = true;
+    $('gobtn').disabled = true;
+    $('in').value = '';
+    msgs.push({ role: 'user', content: t });
+    add('user', t);
+    var el = add('assistant', '...');
+    var out = '';
+    try {
+      var r = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'X-Proxy-Token': token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: $('model').value, messages: msgs }),
+      });
+      if (!r.ok || !r.body) throw new Error((await r.text()) || 'HTTP ' + r.status);
+      var rd = r.body.getReader();
+      var dec = new TextDecoder();
+      var buf = '';
+      for (;;) {
+        var x = await rd.read();
+        if (x.done) break;
+        buf += dec.decode(x.value, { stream: true });
+        var lines = buf.split('\n');
+        buf = lines.pop();
+        lines.forEach(function (l) {
+          if (l.indexOf('data:') !== 0) return;
+          try {
+            var j = JSON.parse(l.slice(5));
+            if (j.type === 'content_block_delta' && j.delta && j.delta.text) out += j.delta.text;
+            else if (j.type === 'error') out += '\n[error: ' + ((j.error && j.error.message) || 'unknown') + ']';
+          } catch (e) {}
+        });
+        el.textContent = out || '...';
+        $('log').scrollTop = $('log').scrollHeight;
+      }
+      if (!out) throw new Error('Empty reply.');
+      msgs.push({ role: 'assistant', content: out });
+      save();
+    } catch (e) {
+      msgs.pop();
+      el.className = 'msg err';
+      el.textContent = 'Error: ' + ((e && e.message) || e);
+      $('in').value = t;
+    }
+    busy = false;
+    $('gobtn').disabled = false;
+    $('in').focus();
+  }
+
+  $('send').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    send();
+  });
+  $('in').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      send();
+    }
+  });
+  $('new').addEventListener('click', function () {
+    if (busy) return;
+    msgs = [];
+    save();
+    $('log').textContent = '';
+  });
+  $('model').addEventListener('change', function () {
+    try {
+      sessionStorage.setItem('pp_model', $('model').value);
+    } catch (e) {}
+  });
+  $('in').focus();
+}
+
+function serveChat() {
+  return servePage('Claude', CHAT_CSS, CHAT_BODY, chatMain);
 }
