@@ -1,0 +1,8 @@
+{
+  "name": "browser",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "keep_names": false
+  // Optional: shared lockout across Cloudflare locations. Create a KV namespace, then uncomment:
+  // "kv_namespaces": [{ "binding": "THROTTLE", "id": "<your-kv-namespace-id>" }]
+}
