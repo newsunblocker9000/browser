@@ -15,7 +15,9 @@
  * Gateway behaviour
  *  - Fetches the target server-side; blocks localhost / private / metadata addresses and odd
  *    ports, re-checking every redirect hop.
- *  - GET, HEAD and POST (urlencoded, up to 2 MB). No cookies are sent or stored.
+ *  - GET, HEAD and POST (urlencoded, up to 2 MB). Cookies are never stored here: the app keeps
+ *    its own jar and sends it in X-Proxy-Jar; the Worker applies it per hop and returns changes
+ *    in X-Proxy-Cookies.
  *  - Rewrites HTML so images, CSS, fonts and media go through this Worker (rw=0 disables).
  *    Scripts and inline handlers are stripped unless js=1. Iframes/objects/embeds removed.
  *  - raw=1 returns HTML untouched (the Source view).
@@ -95,9 +97,13 @@ async function handle(request, env) {
     raw: url.searchParams.get('raw') === '1',
   };
 
-  const { resp, final } = await fetchUpstream(request, target, bodyBuf);
+  const jar = parseJar(request.headers.get('X-Proxy-Jar'));
+  const ref = request.headers.get('X-Proxy-Referer') || '';
+  const { resp, final, changes } = await fetchUpstream(request, target, bodyBuf, jar, ref);
 
   const out = new Headers({ ...ACAO, ...SECURITY });
+  const packed = packJar(changes);
+  if (packed) out.set('X-Proxy-Cookies', packed);
   for (const h of COPY_HEADERS) {
     const v = resp.headers.get(h);
     if (v) out.set(h, v);
@@ -144,10 +150,12 @@ function fail(status, msg, extra) {
 
 /* ─────────────────────────────── upstream ─────────────────────────────── */
 
-async function fetchUpstream(request, target, bodyBuf) {
+async function fetchUpstream(request, target, bodyBuf, jar, ref) {
   let method = request.method;
   let body = bodyBuf;
   let cur = target;
+  const work = jar.slice();
+  const changes = [];
 
   const base = new Headers({
     'User-Agent': UA,
@@ -158,20 +166,40 @@ async function fetchUpstream(request, target, bodyBuf) {
   if (range) base.set('Range', range);
   const ct = request.headers.get('Content-Type');
 
+  let refUrl = null;
+  if (ref) {
+    try {
+      const r = new URL(ref);
+      if (r.protocol === 'http:' || r.protocol === 'https:') refUrl = r;
+    } catch (_) {}
+  }
+
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     const h = new Headers(base);
     if (body && ct) h.set('Content-Type', ct);
+    const ck = cookieHeader(work, cur);
+    if (ck) h.set('Cookie', ck);
+    if (refUrl) h.set('Referer', refUrl.href);
+    if (method === 'POST') h.set('Origin', refUrl ? refUrl.origin : cur.origin);
 
     const resp = await fetch(cur.href, { method, headers: h, body: body || undefined, redirect: 'manual' });
 
+    for (const sc of setCookies(resp)) {
+      const c = parseSetCookie(sc, cur);
+      if (c) {
+        applyCookie(work, c);
+        changes.push(c);
+      }
+    }
+
     if ([301, 302, 303, 307, 308].includes(resp.status)) {
       const loc = resp.headers.get('Location');
-      if (!loc) return { resp, final: cur };
+      if (!loc) return { resp, final: cur, changes };
       let next;
       try {
         next = new URL(loc, cur);
       } catch (_) {
-        return { resp, final: cur };
+        return { resp, final: cur, changes };
       }
       const checked = parseTarget(next.href);
       if (!checked) throw new Error('Redirect to a blocked address.');
@@ -182,9 +210,119 @@ async function fetchUpstream(request, target, bodyBuf) {
       cur = checked;
       continue;
     }
-    return { resp, final: cur };
+    return { resp, final: cur, changes };
   }
   throw new Error('Too many redirects.');
+}
+
+/* ───────────────────────────── cookie jar ─────────────────────────────
+   Cookie shape: { n name, v value, d domain, h 1=host-only, p path, s 1=secure, e expiry ms (0 = session, -1 = delete) } */
+
+const COOKIE_NAME = /^[^\s;=,"\\\x00-\x1f\x7f]+$/;
+const COOKIE_VALUE = /^[^\x00-\x1f\x7f;]*$/;
+
+function setCookies(resp) {
+  if (typeof resp.headers.getSetCookie === 'function') return resp.headers.getSetCookie();
+  const v = resp.headers.get('Set-Cookie');
+  return v ? [v] : [];
+}
+
+function parseSetCookie(str, url) {
+  const parts = str.split(';');
+  const eq = parts[0].indexOf('=');
+  if (eq < 1) return null;
+  const n = parts[0].slice(0, eq).trim();
+  const v = parts[0].slice(eq + 1).trim();
+  if (!COOKIE_NAME.test(n) || !COOKIE_VALUE.test(v)) return null;
+  const host = url.hostname.toLowerCase();
+  const slash = url.pathname.lastIndexOf('/');
+  const c = { n, v, d: host, h: 1, p: slash > 0 ? url.pathname.slice(0, slash) : '/', s: 0, e: 0 };
+  let maxAge = null;
+  let expires = null;
+  for (const raw of parts.slice(1)) {
+    const j = raw.indexOf('=');
+    const k = (j < 0 ? raw : raw.slice(0, j)).trim().toLowerCase();
+    const val = j < 0 ? '' : raw.slice(j + 1).trim();
+    if (k === 'domain' && val) {
+      const d = val.replace(/^\./, '').toLowerCase();
+      if (!d.includes('.') || !(host === d || host.endsWith('.' + d))) return null;
+      c.d = d;
+      c.h = 0;
+    } else if (k === 'path' && val.startsWith('/')) {
+      c.p = val;
+    } else if (k === 'secure') {
+      c.s = 1;
+    } else if (k === 'max-age') {
+      const m = parseInt(val, 10);
+      if (!isNaN(m)) maxAge = m;
+    } else if (k === 'expires') {
+      const t = Date.parse(val);
+      if (!isNaN(t)) expires = t;
+    }
+  }
+  if (maxAge !== null) c.e = maxAge <= 0 ? -1 : Date.now() + maxAge * 1000;
+  else if (expires !== null) c.e = expires <= Date.now() ? -1 : expires;
+  return c;
+}
+
+function applyCookie(list, c) {
+  const i = list.findIndex((x) => x.n === c.n && x.d === c.d && x.p === c.p);
+  if (i >= 0) list.splice(i, 1);
+  if (c.e !== -1) list.push(c);
+}
+
+function pathMatch(req, p) {
+  return req === p || (req.startsWith(p) && (p.endsWith('/') || req.charAt(p.length) === '/'));
+}
+
+function cookieHeader(list, url) {
+  const host = url.hostname.toLowerCase();
+  const now = Date.now();
+  const https = url.protocol === 'https:';
+  return list
+    .filter(
+      (c) =>
+        (!c.e || c.e > now) &&
+        (c.h ? host === c.d : host === c.d || host.endsWith('.' + c.d)) &&
+        (!c.s || https) &&
+        pathMatch(url.pathname, c.p)
+    )
+    .sort((a, b) => b.p.length - a.p.length)
+    .map((c) => c.n + '=' + c.v)
+    .join('; ');
+}
+
+function parseJar(h) {
+  if (!h) return [];
+  try {
+    const a = JSON.parse(atob(h));
+    if (!Array.isArray(a)) return [];
+    return a
+      .slice(0, 400)
+      .filter(
+        (c) =>
+          c &&
+          typeof c.n === 'string' &&
+          typeof c.v === 'string' &&
+          typeof c.d === 'string' &&
+          typeof c.p === 'string' &&
+          COOKIE_NAME.test(c.n) &&
+          COOKIE_VALUE.test(c.v)
+      )
+      .map((c) => ({ n: c.n, v: c.v, d: c.d.toLowerCase(), h: c.h ? 1 : 0, p: c.p, s: c.s ? 1 : 0, e: Number(c.e) || 0 }));
+  } catch (_) {
+    return [];
+  }
+}
+
+function packJar(list) {
+  const a = list.slice();
+  while (a.length) {
+    const s = JSON.stringify(a).replace(/[\u007f-\uffff]/g, (ch) => '\\u' + ('0000' + ch.charCodeAt(0).toString(16)).slice(-4));
+    if (s.length <= 6000) return btoa(s);
+    a.pop();
+  }
+  return '';
 }
 
 /* ───────────────────────────── target checks ──────────────────────────── */
@@ -545,6 +683,7 @@ const APP_BODY = `
       <div id="tabs"></div>
       <button id="addtab" type="button" title="New tab">+</button>
       <div class="spacer"></div>
+      <button class="link" id="clearck" type="button">Clear cookies</button>
       <button class="link" id="popout" type="button">Pop out</button>
       <button class="link" id="lock" type="button">Lock</button>
     </div>
@@ -567,7 +706,7 @@ const APP_BODY = `
     <iframe id="frame" sandbox="allow-scripts allow-forms" title="Page"></iframe>
     <pre id="text" class="hidden"></pre>
   </main>
-  <footer><span id="status">Ready</span></footer>
+  <footer><span id="status">Ready</span><span class="spacer"></span><span id="ck"></span></footer>
 </div>
 `;
 
@@ -579,8 +718,11 @@ function appMain() {
   };
   var TOK = 'pp_tok';
   var token = '';
+  var JARKEY = 'pp_jar';
   var tabs = [];
   var cur = null;
+  var persist = false;
+  var jar = [];
 
   // Script injected into every rendered page: sends link clicks and form submits to the app.
   var FRAME_JS = [
@@ -635,6 +777,70 @@ function appMain() {
     $('status').textContent = s;
   }
 
+  /* ───────── cookie jar (kept here, sent to the gateway with each request) ───────── */
+
+  function jarLoad() {
+    try {
+      var a = JSON.parse(sget(JARKEY) || '[]');
+      jar = Array.isArray(a) ? a : [];
+    } catch (e) {
+      jar = [];
+    }
+    jarCount();
+  }
+  function jarSave() {
+    sset(JARKEY, JSON.stringify(jar), persist);
+    jarCount();
+  }
+  function jarCount() {
+    $('ck').textContent = jar.length ? jar.length + (jar.length === 1 ? ' cookie' : ' cookies') : '';
+  }
+  function jarClear() {
+    jar = [];
+    sdel(JARKEY);
+    jarCount();
+  }
+  function jarMatches(c, host) {
+    return c.h ? host === c.d : host === c.d || host.endsWith('.' + c.d);
+  }
+  function b64json(a) {
+    return btoa(
+      JSON.stringify(a).replace(/[\u007f-\uffff]/g, function (ch) {
+        return '\\u' + ('0000' + ch.charCodeAt(0).toString(16)).slice(-4);
+      })
+    );
+  }
+  function jarHeader(url) {
+    var now = Date.now();
+    jar = jar.filter(function (c) {
+      return !c.e || c.e > now;
+    });
+    if (!jar.length) return '';
+    var h = b64json(jar);
+    if (h.length > 12000) {
+      var host = hostOf(url);
+      h = b64json(
+        jar.filter(function (c) {
+          return jarMatches(c, host);
+        })
+      );
+    }
+    return h.length > 12000 ? '' : h;
+  }
+  function jarMerge(h) {
+    if (!h) return;
+    try {
+      JSON.parse(atob(h)).forEach(function (c) {
+        jar = jar.filter(function (x) {
+          return !(x.n === c.n && x.d === c.d && x.p === c.p);
+        });
+        if (c.e !== -1) jar.push(c);
+      });
+      if (jar.length > 400) jar = jar.slice(-400);
+      jarSave();
+    } catch (e) {}
+  }
+
   /* ───────── login ───────── */
 
   async function tryLogin(pw, remember, auto) {
@@ -648,7 +854,9 @@ function appMain() {
       }
       if (r.ok && (await r.text()) === 'ok') {
         token = pw;
+        persist = !!remember;
         sset(TOK, pw, remember);
+        jarLoad();
         msg.textContent = '';
         $('pw').value = '';
         showApp();
@@ -671,6 +879,7 @@ function appMain() {
   function lock(message) {
     token = '';
     sdel(TOK);
+    jarClear();
     tabs = [];
     cur = null;
     $('frame').srcdoc = '';
@@ -785,13 +994,13 @@ function appMain() {
 
   /* ───────── navigation ───────── */
 
-  function go(url, body) {
+  function go(url, body, ref) {
     if (!cur) return;
     var t = cur;
     var u = normalise(url);
     if (!u) return;
     t.hist = t.hist.slice(0, t.i + 1);
-    t.hist.push({ url: u, body: body == null ? null : body, content: null });
+    t.hist.push({ url: u, body: body == null ? null : body, ref: ref || '', content: null });
     t.i = t.hist.length - 1;
     load(t, t.hist[t.i]);
   }
@@ -826,6 +1035,9 @@ function appMain() {
     var title = '';
     try {
       var init = { headers: { 'X-Proxy-Token': token }, cache: 'no-store' };
+      var jh = jarHeader(entry.url);
+      if (jh) init.headers['X-Proxy-Jar'] = jh;
+      if (entry.ref) init.headers['X-Proxy-Referer'] = entry.ref;
       if (entry.body != null) {
         init.method = 'POST';
         init.headers['Content-Type'] = 'application/x-www-form-urlencoded';
@@ -837,6 +1049,7 @@ function appMain() {
         lock('The gateway rejected the passphrase.');
         return;
       }
+      jarMerge(r.headers.get('X-Proxy-Cookies'));
       if (r.headers.get('X-Proxy-Error')) {
         content = { kind: 'text', text: 'Error ' + r.status + ': ' + (await r.text()) };
       } else {
@@ -952,6 +1165,10 @@ function appMain() {
   $('lock').addEventListener('click', function () {
     lock('');
   });
+  $('clearck').addEventListener('click', function () {
+    jarClear();
+    status('Cookies cleared');
+  });
   $('popout').addEventListener('click', function () {
     window.open(location.href, '_blank', 'popup=yes,width=1200,height=800');
   });
@@ -966,16 +1183,26 @@ function appMain() {
     if (!cur || ev.source !== $('frame').contentWindow) return;
     var m = ev.data;
     if (!m || typeof m !== 'object' || typeof m.u !== 'string' || !/^https?:\/\//i.test(m.u)) return;
+    var ce = cur.hist[cur.i];
+    var from = ce ? ce.final || ce.url : '';
     if (m.t === 'nav') {
-      if (m.nt) newTab(m.u);
-      else go(m.u);
+      if (m.nt) {
+        newTab();
+        go(m.u, null, from);
+      } else go(m.u, null, from);
     } else if (m.t === 'form' && typeof m.b === 'string') {
-      go(m.u, m.b);
+      go(m.u, m.b, from);
     }
   });
 
   var saved = sget(TOK);
-  if (saved) tryLogin(saved, !!localStorage.getItem(TOK), true);
+  if (saved) {
+    var inLocal = false;
+    try {
+      inLocal = !!localStorage.getItem(TOK);
+    } catch (e) {}
+    tryLogin(saved, inLocal, true);
+  }
 }
 
 function serveApp() {
