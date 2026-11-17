@@ -23,6 +23,8 @@
  *  - Rewrites HTML so images, CSS, fonts and media go through this Worker (rw=0 disables).
  *    Scripts and inline handlers are stripped unless js=1. Iframes/objects/embeds removed.
  *  - raw=1 returns HTML untouched (the Source view).
+ *  - A GET answered with 403 is retried through Jina Reader (pages) or wsrv.nl (images).
+ *    Optional secret JINA_API_KEY raises Jina's rate limit.
  *  - Repeated wrong passphrases from one IP are locked out for 15 minutes.
  */
 
@@ -105,7 +107,20 @@ async function handle(request, env) {
 
   const jar = parseJar(request.headers.get('X-Proxy-Jar'));
   const ref = request.headers.get('X-Proxy-Referer') || '';
-  const { resp, final, changes } = await fetchUpstream(request, target, bodyBuf, jar, ref);
+  const up = await fetchUpstream(request, target, bodyBuf, jar, ref);
+  const { final, changes } = up;
+  let resp = up.resp;
+  let via = '';
+
+  // Some sites (BBC, for one) answer every Cloudflare Worker with 403 "Access Denied".
+  // For GETs, retry through an outside fetcher: Jina Reader for pages, wsrv.nl for images.
+  if (resp.status === 403 && request.method === 'GET') {
+    const fb = await fallbackFetch(final, resp, env);
+    if (fb) {
+      resp = fb.resp;
+      via = fb.via;
+    }
+  }
 
   const out = new Headers({ ...ACAO, ...SECURITY });
   const packed = packJar(changes);
@@ -115,6 +130,7 @@ async function handle(request, env) {
     if (v) out.set(h, v);
   }
   out.set('X-Final-URL', final.href);
+  if (via) out.set('X-Proxy-Via', via);
 
   const ctype = (resp.headers.get('Content-Type') || '').toLowerCase();
   const isHtml = /text\/html|application\/xhtml\+xml/.test(ctype);
@@ -219,6 +235,34 @@ async function fetchUpstream(request, target, bodyBuf, jar, ref) {
     return { resp, final: cur, changes };
   }
   throw new Error('Too many redirects.');
+}
+
+/* ─────────────────────────────── fallback ─────────────────────────────── */
+
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|bmp|ico|svg)(\?|$)/i;
+
+async function fallbackFetch(final, blocked, env) {
+  const ctype = (blocked.headers.get('Content-Type') || '').toLowerCase();
+  const looksImage = IMAGE_EXT.test(final.pathname) || ctype.startsWith('image/');
+  try {
+    if (looksImage) {
+      const r = await fetch('https://wsrv.nl/?url=' + encodeURIComponent(final.href), { headers: { 'User-Agent': UA } });
+      if (!r.ok || !(r.headers.get('Content-Type') || '').startsWith('image/')) return null;
+      return { resp: r, via: 'wsrv' };
+    }
+    const h = { 'X-Return-Format': 'html', Accept: 'text/html' };
+    if (env.JINA_API_KEY) h.Authorization = 'Bearer ' + env.JINA_API_KEY;
+    const r = await fetch('https://r.jina.ai/' + final.href, { headers: h });
+    if (!r.ok) return null;
+    const html = await r.text();
+    if (!/<html|<body|<head/i.test(html.slice(0, 2000))) return null;
+    return {
+      resp: new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }),
+      via: 'jina',
+    };
+  } catch (_) {
+    return null;
+  }
 }
 
 /* ───────────────────────────── cookie jar ─────────────────────────────
@@ -1084,7 +1128,8 @@ function appMain() {
           var name = (entry.final || entry.url).split('?')[0].split('/').pop() || 'download';
           content = { kind: 'file', url: URL.createObjectURL(await r.blob()), name: name };
         }
-        status(r.status + ' · ' + hostOf(entry.final));
+        var via = r.headers.get('X-Proxy-Via');
+        status(r.status + ' · ' + hostOf(entry.final) + (via ? ' · via fallback (' + via + ')' : ''));
       }
     } catch (e) {
       if (rid !== t.rid) return;
